@@ -123,11 +123,8 @@ fn send_frame(
     header: [u8; DMD_HEADER_SIZE],
     im: &[u8],
 ) -> Result<(), std::io::Error> {
-    let combined = [header.as_ref(), im].concat();
-    client.write(&combined)?;
-    // for a reason i ignore (a bug in dmd server ?, non combination doesn't work for animated gif over network)
-    //client.write_all(&header)?;
-    //client.write_all(im)?;
+    client.write_all(&header)?;
+    client.write_all(im)?;
     client.flush()?;
     Ok(())
 }
