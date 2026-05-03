@@ -108,6 +108,15 @@ struct Cli {
     /// for compatibility only
     #[arg(long, default_value_t = false)]
     no_fit: bool,
+    /// playlist: one or more files or a directory (plays all supported images in sequence)
+    #[arg(short = 'd', long, num_args(1..))]
+    playlist: Vec<String>,
+    /// time to display each static image in playlist (ms)
+    #[arg(long, default_value_t = 3000)]
+    item_duration: u64,
+    /// shuffle playlist order
+    #[arg(long, default_value_t = false)]
+    shuffle: bool,
 }
 
 const DMD_HEADER_SIZE: usize = 10 + 1 + 4 + 2 + 2 + 1 + 1 + 4;
@@ -417,6 +426,90 @@ fn send_image_file_basic(
     Ok(())
 }
 
+const SUPPORTED_EXTENSIONS: &[&str] = &["gif", "png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp"];
+
+fn list_supported_files(dir: &str) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+                if let Some(s) = path.to_str() {
+                    files.push(s.to_string());
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn shuffle_vec<T>(v: &mut Vec<T>) {
+    // Fisher-Yates using a simple LCG seeded from system time
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    for i in (1..v.len()).rev() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (seed >> 33) as usize % (i + 1);
+        v.swap(i, j);
+    }
+}
+
+fn handle_playlist(
+    dmd: &DmdConfig,
+    client: &TcpStream,
+    paths: Vec<String>,
+    item_duration: u64,
+    do_shuffle: bool,
+    once: bool,
+) -> Result<(), String> {
+    let mut files: Vec<String> = Vec::new();
+
+    for path in paths {
+        if Path::new(&path).is_dir() {
+            let mut dir_files = list_supported_files(&path)?;
+            files.append(&mut dir_files);
+        } else {
+            files.push(path);
+        }
+    }
+
+    if files.is_empty() {
+        return Err(String::from("No supported files found in playlist"));
+    }
+
+    loop {
+        let mut ordered = files.clone();
+        if do_shuffle {
+            shuffle_vec(&mut ordered);
+        }
+
+        for file in &ordered {
+            match handle_case_file(dmd, client, file, true) {
+                Ok(was_animated) => {
+                    if !was_animated {
+                        thread::sleep(Duration::from_millis(item_duration));
+                    }
+                }
+                Err(e) => eprintln!("Skipping {}: {}", file, e),
+            }
+        }
+
+        if once {
+            return Ok(());
+        }
+    }
+}
+
 fn strfdelta(duration: TimeDelta, format: &str) -> String {
     let total_seconds = duration.num_seconds();
     let days = total_seconds / 86400;
@@ -541,6 +634,7 @@ fn main() {
     if args.text.is_some() { nplay += 1; }
     if args.clock { nplay += 1; }
     if args.countdown.is_some() { nplay += 1; }
+    if !args.playlist.is_empty() { nplay += 1; }
 
     if nplay == 0 {
         eprintln!("Missing something to play");
@@ -679,6 +773,19 @@ fn main() {
             args.countdown_format_0_minute,
             args.countdown_format_0_hour,
             args.countdown_format_0_day,
+        ) {
+            eprintln!("{}", e);
+        }
+    }
+
+    if !args.playlist.is_empty() {
+        if let Err(e) = handle_playlist(
+            &dmd,
+            &client,
+            args.playlist,
+            args.item_duration,
+            args.shuffle,
+            args.once,
         ) {
             eprintln!("{}", e);
         }
