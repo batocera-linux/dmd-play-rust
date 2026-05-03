@@ -3,7 +3,7 @@ use clap::Parser;
 use image::{
     codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, DynamicImage, Rgba, RgbaImage,
 };
-use std::{fs::File, io::BufReader, io::Write, net::TcpStream, thread, time::Duration};
+use std::{fs::File, io::BufReader, io::Write, net::TcpStream, path::Path, thread, time::Duration};
 
 mod imageutils;
 
@@ -16,10 +16,10 @@ struct Cli {
     #[arg(short, long, default_value_t = 6789)]
     port: u16,
     /// image path file
-    #[arg(short, long, default_value=None)]
+    #[arg(short, long, default_value = None)]
     file: Option<String>,
     /// text
-    #[arg(short, long, default_value=None)]
+    #[arg(short, long, default_value = None)]
     text: Option<String>,
     /// display current time
     #[arg(long, default_value_t = false)]
@@ -28,16 +28,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_seconds: bool,
     /// clock: strftime-formatted string (superseeds --h12 and --no-seconds)
-    #[arg(long, default_value=None)]
+    #[arg(long, default_value = None)]
     clock_format: Option<String>,
     /// clock: 12-hour format with AM and PM (default it 24h)
     #[arg(long, default_value_t = false)]
     h12: bool,
     /// display a countdown (2050-06-30 15:00:00)
-    #[arg(long, default_value=None)]
+    #[arg(long, default_value = None)]
     countdown: Option<String>,
     /// equivalent of changing all format with a prefix
-    #[arg(long, default_value=None)]
+    #[arg(long, default_value = None)]
     countdown_header: Option<String>,
     /// countdown format
     #[arg(long, default_value = "{D:2}d {H:2}:{M:02}:{S:02}")]
@@ -55,7 +55,7 @@ struct Cli {
     #[arg(long, default_value = "/usr/share/fonts/dejavu/DejaVuSans.ttf")]
     font: String,
     /// text alignment: center, left or right
-    #[arg(short, long, default_value=None)]
+    #[arg(short, long, default_value = None)]
     align: Option<String>,
     /// number of pixels between each line of text
     #[arg(short, long, default_value_t = 2)]
@@ -102,20 +102,37 @@ struct Cli {
     /// height
     #[arg(long, default_value = None)]
     height: Option<u32>,
-    /// text alignment: center, left or right
-    #[arg(long, default_value=None)]
+    /// gradient image path
+    #[arg(long, default_value = None)]
     gradient: Option<String>,
     /// for compatibility only
     #[arg(long, default_value_t = false)]
     no_fit: bool,
 }
 
-// network package size
 const DMD_HEADER_SIZE: usize = 10 + 1 + 4 + 2 + 2 + 1 + 1 + 4;
 
 enum DMDLayer {
     MAIN,
     SECOND,
+}
+
+struct DmdConfig {
+    width: u32,
+    height: u32,
+    header: [u8; DMD_HEADER_SIZE],
+}
+
+struct TextConfig<'a> {
+    font_data: &'a [u8],
+    gradient: &'a Option<DynamicImage>,
+    text_color: Rgba<u8>,
+    background_color: Rgba<u8>,
+    text_align: imageutils::TextAlign,
+    line_spacing: u8,
+    moving_text: bool,
+    fixed_text: bool,
+    speed: u32,
 }
 
 fn send_frame(
@@ -169,7 +186,7 @@ fn get_header(width: u16, height: u16, layer: DMDLayer, nbytes: u32) -> [u8; DMD
 
 fn is_text_to_animate(
     text: &str,
-    font_path: &str,
+    font_data: &[u8],
     line_spacing: u8,
     dmd_width: u32,
     dmd_height: u32,
@@ -181,21 +198,14 @@ fn is_text_to_animate(
     let lines = text.split("\\n");
     let nlines = lines.clone().count() as u32;
 
-    // animate if we use less than 1/3 of the height
     let accepable_ratio = 3.0;
     let all_spaces = line_spacing as u32 * (nlines - 1);
     let section_height = ((dmd_height - all_spaces) / nlines) as u32;
     let dmd_ratio = dmd_width as f32 / dmd_height as f32;
 
     for line in lines {
-        let text_ratio = match imageutils::get_text_ratio(line, font_path, section_height) {
-            Ok(x) => x,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        let text_ratio = imageutils::get_text_ratio(line, font_data, section_height)?;
 
-        // if at least one line require animation, then animate.
         let local_should_animate = text_ratio > dmd_ratio * accepable_ratio;
         if local_should_animate || force_moving_text {
             should_animate = true;
@@ -206,59 +216,47 @@ fn is_text_to_animate(
         }
     }
 
-    // when the text is to animate, compute the real part of the animation
     Ok((should_animate, animation_new_width))
 }
 
 fn get_dmd_animation_from_text(
     text: &str,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     text_width: u32,
-    background_color: Rgba<u8>,
-    text_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    speed: u32,
 ) -> Result<(Vec<Box<[u8]>>, Vec<u32>), String> {
     let (dyn_img, start, real_width) = imageutils::generate_text_image(
         text,
-        font_path,
-        &gradient,
+        txt.font_data,
+        txt.gradient,
         text_width,
-        dmd_height,
-        background_color,
-        text_color,
-        text_align,
-        line_spacing,
+        dmd.height,
+        txt.background_color,
+        txt.text_color,
+        &txt.text_align,
+        txt.line_spacing,
     )?;
 
     let mut frames_dmd = Vec::new();
     let mut frames_duration = Vec::new();
 
-    for npixel in (0..dmd_width + (real_width - dmd_width) + dmd_width).rev() {
-        let mut new_img = RgbaImage::new(dmd_width, dmd_height);
+    for npixel in (0..dmd.width + (real_width - dmd.width) + dmd.width).rev() {
+        let mut new_img = RgbaImage::new(dmd.width, dmd.height);
         imageutils::copy_image(
             &dyn_img,
             &mut new_img,
             npixel as i32 - start as i32 - real_width as i32,
             0,
         );
-        let img565: Box<[u8]> = match imageutils::image2dmdimage(
+        let img565: Box<[u8]> = imageutils::image2dmdimage(
             &new_img,
             &imageutils::TextAlign::CENTER,
-            dmd_width,
-            dmd_height,
-        ) {
-            Ok(img) => img,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+            dmd.width,
+            dmd.height,
+        )
+        .map_err(|e| e.to_string())?;
         frames_dmd.push(img565);
-        frames_duration.push(speed);
+        frames_duration.push(txt.speed);
     }
 
     Ok((frames_dmd, frames_duration))
@@ -266,167 +264,114 @@ fn get_dmd_animation_from_text(
 
 fn send_image_text(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     text: &str,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    force_moving_text: bool,
-    force_fixed_text: bool,
-    speed: u32,
     once: bool,
 ) -> Result<bool, String> {
-    let mut new_width = dmd_width;
+    let mut new_width = dmd.width;
 
     let (mut should_animate, animation_new_width) = is_text_to_animate(
         text,
-        font_path,
-        line_spacing,
-        dmd_width,
-        dmd_height,
-        force_moving_text,
+        txt.font_data,
+        txt.line_spacing,
+        dmd.width,
+        dmd.height,
+        txt.moving_text,
     )?;
 
     if should_animate {
         new_width = animation_new_width;
     }
 
-    // some options forces
-    if force_moving_text == false && force_fixed_text {
+    if !txt.moving_text && txt.fixed_text {
         should_animate = false;
     }
 
-    // play the animation, thus first, generate images, then play
     if should_animate {
-        let (frames_dmd, frames_duration) = get_dmd_animation_from_text(
-            text,
-            font_path,
-            &gradient,
-            dmd_width,
-            dmd_height,
-            new_width,
-            background_color,
-            text_color,
-            text_align,
-            line_spacing,
-            speed,
-        )?;
-        play_animation(header, &client, &frames_dmd, frames_duration, once)?;
+        let (frames_dmd, frames_duration) =
+            get_dmd_animation_from_text(text, dmd, txt, new_width)?;
+        play_animation(dmd.header, client, &frames_dmd, frames_duration, once)?;
         Ok(true)
     } else {
         let (dyn_img, _start, _new_width) = imageutils::generate_text_image(
             text,
-            font_path,
-            &gradient,
-            dmd_width,
-            dmd_height,
-            background_color,
-            text_color,
-            text_align,
-            line_spacing,
+            txt.font_data,
+            txt.gradient,
+            dmd.width,
+            dmd.height,
+            txt.background_color,
+            txt.text_color,
+            &txt.text_align,
+            txt.line_spacing,
         )?;
 
-        let img565 = match imageutils::image2dmdimage(&dyn_img, text_align, dmd_width, dmd_height) {
-            Ok(x) => x,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        let img565 = imageutils::image2dmdimage(&dyn_img, &txt.text_align, dmd.width, dmd.height)
+            .map_err(|e| e.to_string())?;
 
-        match send_frame(&client, header, &img565) {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        send_frame(client, dmd.header, &img565).map_err(|e| e.to_string())?;
         Ok(false)
     }
 }
 
 fn handle_case_file(
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
     client: &TcpStream,
-    file: String,
+    file: &str,
     once: bool,
 ) -> Result<bool, String> {
-    if file.len() >= 4 && &file[file.len() - 4..] == ".gif" {
-        send_image_file_gif(header, dmd_width, dmd_height, client, file, once)
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if ext == "gif" {
+        send_image_file_gif(dmd, client, file, once)
     } else {
-        send_image_file_basic(client, header, dmd_width, dmd_height, file)?;
+        send_image_file_basic(client, dmd, file)?;
         Ok(false)
     }
 }
 
 fn send_image_file_gif(
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
     client: &TcpStream,
-    file: String,
+    file: &str,
     once: bool,
 ) -> Result<bool, String> {
-    let fd = match File::open(file) {
-        Ok(x) => x,
-        Err(e) => return Err(e.to_string()),
-    };
+    let fd = File::open(file).map_err(|e| e.to_string())?;
     let reader = BufReader::new(fd);
-    let decoder = match GifDecoder::new(reader) {
-        Ok(x) => x,
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
+    let decoder = GifDecoder::new(reader).map_err(|e| e.to_string())?;
 
     let frames = decoder.into_frames();
     let mut frames_dmd = Vec::new();
     let mut frames_duration = Vec::new();
 
-    // build the animation array
     for frame in frames {
-        let frame = match frame {
-            Ok(x) => x,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        let frame = frame.map_err(|e| e.to_string())?;
         let (x, y) = frame.delay().numer_denom_ms();
         let duration = (x as f32 / y as f32) as u32;
 
         let orig_img = frame.into_buffer();
 
-        let img565: Box<[u8]> = match imageutils::image2dmdimage(
+        let img565: Box<[u8]> = imageutils::image2dmdimage(
             &orig_img,
             &imageutils::TextAlign::CENTER,
-            dmd_width,
-            dmd_height,
-        ) {
-            Ok(img) => img,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+            dmd.width,
+            dmd.height,
+        )
+        .map_err(|e| e.to_string())?;
 
         frames_dmd.push(img565);
         frames_duration.push(duration);
     }
 
     if frames_dmd.len() == 1 {
-        match send_frame(&client, header, &frames_dmd[0]) {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        send_frame(client, dmd.header, &frames_dmd[0]).map_err(|e| e.to_string())?;
         Ok(false)
     } else {
-        play_animation(header, &client, &frames_dmd, frames_duration, once)?;
+        play_animation(dmd.header, client, &frames_dmd, frames_duration, once)?;
         Ok(true)
     }
 }
@@ -434,24 +379,14 @@ fn send_image_file_gif(
 fn play_animation(
     header: [u8; DMD_HEADER_SIZE],
     client: &TcpStream,
-    frames_dmd: &Vec<Box<[u8]>>,
+    frames_dmd: &[Box<[u8]>],
     frames_duration: Vec<u32>,
     once: bool,
 ) -> Result<(), String> {
-    let mut n;
-
     loop {
-        n = 0;
-        for img565 in frames_dmd {
-            match send_frame(&client, header, &img565) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(e.to_string());
-                }
-            };
-
+        for (n, img565) in frames_dmd.iter().enumerate() {
+            send_frame(client, header, img565).map_err(|e| e.to_string())?;
             thread::sleep(Duration::from_millis(frames_duration[n] as u64));
-            n = n + 1;
         }
 
         if once {
@@ -462,44 +397,23 @@ fn play_animation(
 
 fn send_image_file_basic(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    file: String,
+    dmd: &DmdConfig,
+    file: &str,
 ) -> Result<(), String> {
-    let orig_img_code = match Reader::open(file) {
-        Ok(x) => x,
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
+    let orig_img = Reader::open(file)
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())?;
 
-    let orig_img = match orig_img_code.decode() {
-        Ok(x) => x,
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
-
-    let img565: Box<[u8]> = match imageutils::image2dmdimage(
+    let img565: Box<[u8]> = imageutils::image2dmdimage(
         &orig_img,
         &imageutils::TextAlign::CENTER,
-        dmd_width,
-        dmd_height,
-    ) {
-        Ok(img) => img,
-        Err(e) => {
-            return Err(e);
-        }
-    };
+        dmd.width,
+        dmd.height,
+    )
+    .map_err(|e| e)?;
 
-    match send_frame(&client, header, &img565) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
-
+    send_frame(client, dmd.header, &img565).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -525,74 +439,39 @@ fn strfdelta(duration: TimeDelta, format: &str) -> String {
 
 fn handle_clock(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    moving_text: bool,
-    fixed_text: bool,
-    speed: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     clock_format: Option<String>,
     h12: bool,
     no_seconds: bool,
 ) {
     let mut previous_txt = String::new();
-    let mut localtime;
 
     loop {
         let now = Local::now();
 
-        match clock_format {
-            Some(ref x) => {
-                localtime = now.format(&x).to_string();
-            }
+        let localtime = match clock_format {
+            Some(ref x) => now.format(x).to_string(),
             None => {
                 if h12 {
                     if no_seconds {
-                        localtime = now.format("%-I:%M %p").to_string();
+                        now.format("%-I:%M %p").to_string()
                     } else {
-                        localtime = now.format("%-I:%M:%S %p").to_string();
+                        now.format("%-I:%M:%S %p").to_string()
                     }
+                } else if no_seconds {
+                    now.format("%H:%M").to_string()
                 } else {
-                    if no_seconds {
-                        localtime = now.format("%H:%M").to_string();
-                    } else {
-                        localtime = now.format("%H:%M:%S").to_string();
-                    }
+                    now.format("%H:%M:%S").to_string()
                 }
             }
-        }
+        };
 
         if previous_txt != localtime {
             previous_txt = localtime.clone();
-
-            let _ = match send_image_text(
-                &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &localtime,
-                &font_path,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                line_spacing,
-                moving_text,
-                fixed_text,
-                speed,
-                true,
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                }
-            };
+            if let Err(e) = send_image_text(client, dmd, txt, &localtime, true) {
+                eprintln!("{}", e);
+            }
         }
 
         thread::sleep(Duration::from_millis(1000));
@@ -601,18 +480,8 @@ fn handle_clock(
 
 fn handle_countdown(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    moving_text: bool,
-    fixed_text: bool,
-    speed: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     countdown: String,
     countdown_header: Option<String>,
     countdown_format: String,
@@ -620,103 +489,58 @@ fn handle_countdown(
     countdown_format_0_hour: String,
     countdown_format_0_day: String,
 ) -> Result<(), String> {
-    match NaiveDateTime::parse_from_str(&countdown.to_string(), "%Y-%m-%d %H:%M:%S") {
-        Ok(target) => {
-            let mut previous_txt = String::new();
-            let mut countdown_str: String;
+    let target = NaiveDateTime::parse_from_str(&countdown, "%Y-%m-%d %H:%M:%S")
+        .map_err(|e| e.to_string())?;
 
-            let target_datetime = match Local.from_local_datetime(&target).earliest() {
-                Some(x) => x,
-                None => {
-                    return Err(String::from("Error parsing"));
-                }
-            };
+    let target_datetime = Local
+        .from_local_datetime(&target)
+        .earliest()
+        .ok_or_else(|| String::from("Error parsing countdown datetime"))?;
 
-            loop {
-                let now = Local::now();
+    let mut previous_txt = String::new();
 
-                let delta = (target_datetime - now).abs();
-                let total_seconds = delta.num_seconds();
+    loop {
+        let now = Local::now();
+        let delta = (target_datetime - now).abs();
+        let total_seconds = delta.num_seconds();
 
-                if (total_seconds >= 0 && total_seconds < 60)
-                    || (total_seconds < 0 && total_seconds > -60)
-                {
-                    countdown_str = strfdelta(delta, &countdown_format_0_minute.to_string());
-                } else if (total_seconds > 0 && total_seconds < 3600)
-                    || (total_seconds < 0 && total_seconds > -3600)
-                {
-                    countdown_str = strfdelta(delta, &countdown_format_0_hour.to_string());
-                } else if (total_seconds > 0 && total_seconds < 86400)
-                    || (total_seconds < 0 && total_seconds > -86400)
-                {
-                    countdown_str = strfdelta(delta, &countdown_format_0_day.to_string());
-                } else {
-                    countdown_str = strfdelta(delta, &countdown_format.to_string());
-                }
-                match countdown_header {
-                    Some(ref countdown_header) => {
-                        countdown_str = countdown_header.to_owned() + "\\n" + &countdown_str;
-                    }
-                    None => {}
-                }
+        let fmt = if total_seconds < 60 {
+            &countdown_format_0_minute
+        } else if total_seconds < 3600 {
+            &countdown_format_0_hour
+        } else if total_seconds < 86400 {
+            &countdown_format_0_day
+        } else {
+            &countdown_format
+        };
 
-                if previous_txt != countdown_str {
-                    previous_txt = countdown_str.clone();
+        let mut countdown_str = strfdelta(delta, fmt);
 
-                    let _ = match send_image_text(
-                        &client,
-                        header,
-                        dmd_width,
-                        dmd_height,
-                        &countdown_str,
-                        &font_path,
-                        &gradient,
-                        text_color,
-                        background_color,
-                        &text_align,
-                        line_spacing,
-                        moving_text,
-                        fixed_text,
-                        speed,
-                        true,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("{}", e.to_string());
-                        }
-                    };
-                }
+        if let Some(ref header) = countdown_header {
+            countdown_str = header.to_owned() + "\\n" + &countdown_str;
+        }
 
-                thread::sleep(Duration::from_millis(1000));
+        if previous_txt != countdown_str {
+            previous_txt = countdown_str.clone();
+            if let Err(e) = send_image_text(client, dmd, txt, &countdown_str, true) {
+                eprintln!("{}", e);
             }
         }
-        Err(e) => {
-            return Err(e.to_string());
-        }
+
+        thread::sleep(Duration::from_millis(1000));
     }
 }
 
 fn main() {
     let args = Cli::parse();
-    let mut was_animation = false; // set to true to disable overlay sleep time at the end
+    let mut was_animation = false;
 
-    // at least one
     let mut nplay = 0;
-    if args.clear {
-        nplay += 1;
-    }
-    if args.file.is_some() {
-        nplay += 1;
-    }
-    if args.text.is_some() {
-        nplay += 1;
-    }
-    if args.clock {
-        nplay += 1;
-    }
-    if args.countdown.is_some() {
-        nplay += 1;
-    }
+    if args.clear { nplay += 1; }
+    if args.file.is_some() { nplay += 1; }
+    if args.text.is_some() { nplay += 1; }
+    if args.clock { nplay += 1; }
+    if args.countdown.is_some() { nplay += 1; }
 
     if nplay == 0 {
         eprintln!("Missing something to play");
@@ -728,8 +552,12 @@ fn main() {
         return;
     }
 
+    if args.moving_text && args.fixed_text {
+        eprintln!("Warning: --moving-text and --fixed-text are both set; --moving-text takes precedence");
+    }
+
     let server_address = format!("{}:{}", args.host, args.port);
-    let client = match TcpStream::connect(server_address) {
+    let client = match TcpStream::connect(&server_address) {
         Ok(stream) => stream,
         Err(e) => {
             eprintln!("Erreur de connexion au serveur: {}", e);
@@ -737,42 +565,19 @@ fn main() {
         }
     };
 
-    //
-    let mut layer = DMDLayer::MAIN;
+    let mut dmd_width = if args.hd { 256 } else { 128 };
+    let mut dmd_height = if args.hd { 64 } else { 32 };
 
-    let mut dmd_width;
-    let mut dmd_height;
+    if let Some(w) = args.width { dmd_width = w; }
+    if let Some(h) = args.height { dmd_height = h; }
 
-    if args.hd {
-        dmd_width = 256;
-        dmd_height = 64;
-    } else {
-        dmd_width = 128;
-        dmd_height = 32;
-    }
-
-    match args.width {
-        Some(x) => {
-            dmd_width = x;
-        }
-        None => {}
-    };
-
-    match args.height {
-        Some(x) => {
-            dmd_height = x;
-        }
-        None => {}
-    };
-
-    if args.overlay {
-        layer = DMDLayer::SECOND;
-    }
+    let layer = if args.overlay { DMDLayer::SECOND } else { DMDLayer::MAIN };
 
     let background_color = Rgba([0, 0, 0, 255]);
+    // alpha=0 is intentional: image2dmdimage ignores alpha (RGB565), and apply_gradient uses
+    // alpha=0 as the text-pixel mask vs alpha=255 for background pixels
     let text_color = Rgba([args.red, args.green, args.blue, 0]);
 
-    // compute the header only once while it is always the same one
     let header = get_header(
         dmd_width as u16,
         dmd_height as u16,
@@ -780,180 +585,121 @@ fn main() {
         imageutils::get_dmd_buffer_size(dmd_width, dmd_height),
     );
 
-    let text_align;
+    let dmd = DmdConfig {
+        width: dmd_width,
+        height: dmd_height,
+        header,
+    };
 
-    match args.align {
-        Some(align) => match align.as_str() {
-            "center" => text_align = imageutils::TextAlign::CENTER,
-            "left" => text_align = imageutils::TextAlign::LEFT,
-            "right" => text_align = imageutils::TextAlign::RIGHT,
-            _ => {
-                eprintln!("Invalid alignement value");
-                text_align = imageutils::TextAlign::CENTER;
-            }
-        },
-        None => {
-            text_align = imageutils::TextAlign::CENTER;
+    let text_align = match args.align.as_deref() {
+        Some("center") | None => imageutils::TextAlign::CENTER,
+        Some("left") => imageutils::TextAlign::LEFT,
+        Some("right") => imageutils::TextAlign::RIGHT,
+        Some(_) => {
+            eprintln!("Invalid alignment value, defaulting to center");
+            imageutils::TextAlign::CENTER
         }
     };
 
     let gradient = match args.gradient {
-        Some(gradient_path) => match Reader::open(gradient_path) {
-            Ok(gradient_fd) => match gradient_fd.decode() {
-                Ok(img) => {
-                    Some(img.resize_exact(dmd_width, dmd_height, imageops::FilterType::Lanczos3))
-                }
+        Some(ref gradient_path) => match Reader::open(gradient_path) {
+            Ok(fd) => match fd.decode() {
+                Ok(img) => Some(img.resize_exact(dmd_width, dmd_height, imageops::FilterType::Lanczos3)),
                 Err(e) => {
-                    eprintln!("unable to apply gradient: {}", e.to_string());
+                    eprintln!("unable to apply gradient: {}", e);
                     None
                 }
             },
             Err(e) => {
-                eprintln!("unable to apply gradient: {}", e.to_string());
+                eprintln!("unable to apply gradient: {}", e);
                 None
             }
         },
         None => None,
     };
 
-    match args.file {
-        Some(file) => {
-            let _ = match handle_case_file(header, dmd_width, dmd_height, &client, file, args.once)
-            {
-                Ok(x) => {
-                    was_animation = x;
-                }
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                }
-            };
+    let font_data = match imageutils::load_font(&args.font) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
         }
-        None => {}
     };
 
-    match args.text {
-        Some(text) => {
-            let mut dsp_text = text.clone();
-            if args.caps {
-                dsp_text = text.to_uppercase().replace("\\N", "\\n");
-            }
-            let _ = match send_image_text(
-                &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &dsp_text,
-                &args.font,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                args.line_spacing,
-                args.moving_text,
-                args.fixed_text,
-                args.speed,
-                args.once,
-            ) {
-                Ok(x) => {
-                    was_animation = x;
-                }
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                }
-            };
-        }
-        None => {}
+    let txt = TextConfig {
+        font_data: &font_data,
+        gradient: &gradient,
+        text_color,
+        background_color,
+        text_align,
+        line_spacing: args.line_spacing,
+        moving_text: args.moving_text,
+        fixed_text: args.fixed_text,
+        speed: args.speed,
     };
+
+    if let Some(file) = args.file {
+        match handle_case_file(&dmd, &client, &file, args.once) {
+            Ok(x) => was_animation = x,
+            Err(e) => eprintln!("{}", e),
+        }
+    }
+
+    if let Some(text) = args.text {
+        let dsp_text = if args.caps {
+            text.to_uppercase().replace("\\N", "\\n")
+        } else {
+            text
+        };
+        match send_image_text(&client, &dmd, &txt, &dsp_text, args.once) {
+            Ok(x) => was_animation = x,
+            Err(e) => eprintln!("{}", e),
+        }
+    }
 
     if args.clock {
         handle_clock(
             &client,
-            header,
-            dmd_width,
-            dmd_height,
-            &args.font,
-            &gradient,
-            text_color,
-            background_color,
-            &text_align,
-            args.line_spacing,
-            args.moving_text,
-            args.fixed_text,
-            args.speed,
+            &dmd,
+            &txt,
             args.clock_format,
             args.h12,
             args.no_seconds,
         );
     }
 
-    match args.countdown {
-        Some(countdown) => {
-            match handle_countdown(
-                &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &args.font,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                args.line_spacing,
-                args.moving_text,
-                args.fixed_text,
-                args.speed,
-                countdown,
-                args.countdown_header,
-                args.countdown_format,
-                args.countdown_format_0_minute,
-                args.countdown_format_0_hour,
-                args.countdown_format_0_day,
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                }
-            }
+    if let Some(countdown) = args.countdown {
+        if let Err(e) = handle_countdown(
+            &client,
+            &dmd,
+            &txt,
+            countdown,
+            args.countdown_header,
+            args.countdown_format,
+            args.countdown_format_0_minute,
+            args.countdown_format_0_hour,
+            args.countdown_format_0_day,
+        ) {
+            eprintln!("{}", e);
         }
-        None => {}
-    };
+    }
 
     if args.clear {
         was_animation = true;
-
-        let _ = match send_image_text(
-            &client,
-            header,
-            dmd_width,
-            dmd_height,
-            "",
-            &args.font,
-            &gradient,
-            background_color,
-            background_color,
-            &imageutils::TextAlign::CENTER,
-            0,
-            args.moving_text,
-            args.fixed_text,
-            args.speed,
-            args.once,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("{}", e.to_string());
-            }
+        let clear_txt = TextConfig {
+            text_color: background_color,
+            ..txt
         };
+        if let Err(e) = send_image_text(&client, &dmd, &clear_txt, "", args.once) {
+            eprintln!("{}", e);
+        }
     }
 
-    // at the end, if we have overlay, we sleep
-    if args.overlay && was_animation == false {
+    if args.overlay && !was_animation {
         thread::sleep(Duration::from_millis(args.overlay_time));
     }
 
-    let _ = match client.shutdown(std::net::Shutdown::Write) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("{}", e.to_string());
-        }
-    };
+    if let Err(e) = client.shutdown(std::net::Shutdown::Write) {
+        eprintln!("{}", e);
+    }
 }

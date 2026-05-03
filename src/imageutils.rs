@@ -17,7 +17,14 @@ fn rgb888_to_rgb565(r: u8, g: u8, b: u8) -> u16 {
 }
 
 pub fn get_dmd_buffer_size(width: u32, height: u32) -> u32 {
-    return (width * height * 3) as u32;
+    width * height * 2
+}
+
+pub fn load_font(font_path: &str) -> Result<Vec<u8>, String> {
+    match read(Path::new(font_path)) {
+        Ok(x) => Ok(x),
+        Err(_) => Err(String::from("Unable to read font")),
+    }
 }
 
 pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
@@ -26,7 +33,6 @@ pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
     dmd_width: u32,
     dmd_height: u32,
 ) -> Result<Box<[u8]>, String> {
-    // resize the image to something below 128x32
     let (orig_width, orig_height) = orig_img.dimensions();
 
     let new_width;
@@ -47,16 +53,10 @@ pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
         imageops::FilterType::Lanczos3,
     );
 
-    // create the dmd image
     let (width, height) = resized_img.dimensions();
 
     let mut bytes: Box<[u8]> =
         vec![0u8; get_dmd_buffer_size(dmd_width, dmd_height) as usize].into_boxed_slice();
-
-    // init to 0
-    for i in 0..bytes.len() {
-        bytes[i] = 0;
-    }
 
     let x_offset = match text_align {
         TextAlign::CENTER => (dmd_width - width) / 2,
@@ -69,8 +69,7 @@ pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
     for y in 0..dmd_height {
         if y >= y_offset && y < (height + y_offset) {
             for x in 0..dmd_width {
-                let idx_u32: u32 = ((y * dmd_width) + x) * 2;
-                let idx: usize = idx_u32 as usize;
+                let idx: usize = (((y * dmd_width) + x) * 2) as usize;
                 if x >= x_offset && x < (width + x_offset) {
                     let pixel = resized_img.get_pixel(x - x_offset, y - y_offset);
                     let val: u16 = rgb888_to_rgb565(pixel[0], pixel[1], pixel[2]);
@@ -89,7 +88,6 @@ fn get_text_width(font: &Font, scale: Scale, text: &str) -> u32 {
     let mut last_rsb: f32 = 0.0;
 
     for glyph in font.layout(text, scale, point(0.0, 0.0)) {
-        // remove the left side bearing for the first letter LSB
         if n == 0 {
             width -= glyph.unpositioned().h_metrics().left_side_bearing;
         }
@@ -103,9 +101,9 @@ fn get_text_width(font: &Font, scale: Scale, text: &str) -> u32 {
         last_rsb = glyph.unpositioned().h_metrics().advance_width
             - glyph.unpositioned().h_metrics().left_side_bearing
             - glyph_width;
-        n = n + 1;
+        n += 1;
     }
-    width = width - last_rsb;
+    width -= last_rsb;
 
     width.round() as u32
 }
@@ -143,7 +141,6 @@ fn get_text_y(font: &Font, scale: Scale, text: &str) -> i32 {
 
 fn get_text_x(font: &Font, scale: Scale, text: &str) -> i32 {
     for glyph in font.layout(text, scale, point(0.0, 0.0)) {
-        // remove the left side bearing for the first letter
         return -glyph.unpositioned().h_metrics().left_side_bearing.round() as i32;
     }
     0
@@ -151,7 +148,7 @@ fn get_text_x(font: &Font, scale: Scale, text: &str) -> i32 {
 
 pub fn generate_text_image(
     text: &str,
-    font_path: &str,
+    font_data: &[u8],
     gradient: &Option<DynamicImage>,
     width: u32,
     height: u32,
@@ -163,11 +160,10 @@ pub fn generate_text_image(
     let lines = text.split("\\n");
     let nlines = lines.clone().count() as u32;
 
-    // single line
     if nlines == 1 {
         let (mut dyn_img, start, new_width) = generate_text_image_single_line(
             text,
-            font_path,
+            font_data,
             width,
             height,
             background_color,
@@ -175,15 +171,11 @@ pub fn generate_text_image(
             text_align,
         )?;
 
-        match gradient {
-            Some(x) => {
-                dyn_img = apply_gradient(&dyn_img, &x);
-            }
-            None => {}
+        if let Some(x) = gradient {
+            dyn_img = apply_gradient(&dyn_img, x);
         }
         Ok((dyn_img, start, new_width))
     } else {
-        // multiple lines
         let spaces = line_spacing as u32 * (nlines - 1);
         let section_height = (height - spaces) / nlines;
         let mut rgba_img = RgbaImage::new(width, height);
@@ -194,7 +186,7 @@ pub fn generate_text_image(
         for line in lines {
             let (dyn_img, start, new_width) = generate_text_image_single_line(
                 line,
-                font_path,
+                font_data,
                 width,
                 section_height,
                 background_color,
@@ -218,11 +210,8 @@ pub fn generate_text_image(
 
         let mut dyn_img = DynamicImage::ImageRgba8(rgba_img);
 
-        match gradient {
-            Some(x) => {
-                dyn_img = apply_gradient(&dyn_img, &x);
-            }
-            None => {}
+        if let Some(x) = gradient {
+            dyn_img = apply_gradient(&dyn_img, x);
         }
 
         Ok((dyn_img, smallest_start, biggest_end - smallest_start))
@@ -242,65 +231,53 @@ fn apply_gradient(img: &DynamicImage, gradient: &DynamicImage) -> DynamicImage {
             if x < width_gradient && y < height_gradient {
                 let img_pixel = img.get_pixel(x, y);
                 let gradient_pixel = gradient.get_pixel(x, y);
-                let new_pixel;
-                let min_value = 15;
-                let max_alpha = 245;
-                if (img_pixel[0] > min_value
-                    || img_pixel[1] > min_value
-                    || img_pixel[2] > min_value)
-                    && img_pixel[3] < max_alpha
-                {
-                    new_pixel = Rgba([
+                // text pixels have alpha=0 (see text_color in main); background has alpha=255
+                let is_text_pixel = img_pixel[3] == 0
+                    && (img_pixel[0] > 0 || img_pixel[1] > 0 || img_pixel[2] > 0);
+                let new_pixel = if is_text_pixel {
+                    Rgba([
                         gradient_pixel[0],
                         gradient_pixel[1],
                         gradient_pixel[2],
                         img_pixel[3],
-                    ]);
+                    ])
                 } else {
-                    new_pixel = Rgba([0, 0, 0, 0]);
-                }
+                    Rgba([0, 0, 0, 0])
+                };
                 new_img.put_pixel(x, y, new_pixel);
             }
         }
     }
-    return DynamicImage::ImageRgba8(new_img);
+    DynamicImage::ImageRgba8(new_img)
 }
 
-pub fn get_text_ratio(text: &str, font_path: &str, height: u32) -> Result<f32, String> {
-    let font_data = match read(Path::new(&font_path)) {
-        Ok(x) => x,
-        Err(_) => return Err(String::from("Unable to read font")),
-    };
-    let font = match Font::try_from_bytes(&font_data) {
+pub fn get_text_ratio(text: &str, font_data: &[u8], height: u32) -> Result<f32, String> {
+    let font = match Font::try_from_bytes(font_data) {
         Some(x) => x,
-        None => return Err(String::from("Unable to read font")),
+        None => return Err(String::from("Unable to parse font")),
     };
-    let scale = Scale::uniform((height * 5) as f32); // 5x for a nicer image (more precision)
+    let scale = Scale::uniform((height * 5) as f32);
 
     let genwidth = get_text_width(&font, scale, text);
     let genheight = get_text_height(&font, scale, text);
 
-    return Ok(genwidth as f32 / genheight as f32);
+    Ok(genwidth as f32 / genheight as f32)
 }
 
 fn generate_text_image_single_line(
     text: &str,
-    font_path: &str,
+    font_data: &[u8],
     width: u32,
     height: u32,
     background_color: Rgba<u8>,
     text_color: Rgba<u8>,
     text_align: &TextAlign,
 ) -> Result<(DynamicImage, u32, u32), String> {
-    let font_data = match read(Path::new(&font_path)) {
-        Ok(x) => x,
-        Err(_) => return Err(String::from("Unable to read font")),
-    };
-    let font = match Font::try_from_bytes(&font_data) {
+    let font = match Font::try_from_bytes(font_data) {
         Some(x) => x,
-        None => return Err(String::from("Unable to read font")),
+        None => return Err(String::from("Unable to parse font")),
     };
-    let scale = Scale::uniform((height * 5) as f32); // 5x for a nicer image (more precision)
+    let scale = Scale::uniform((height * 5) as f32);
 
     let genwidth = get_text_width(&font, scale, text);
     let genheight = get_text_height(&font, scale, text);
@@ -312,9 +289,8 @@ fn generate_text_image_single_line(
 
     draw_text_mut(&mut dyn_img, text_color, x, y, scale, &font, text);
 
-    // hack: now, crop width cause we know that get_text_width returns too large (for an unknown reason)
+    // hack: crop width because get_text_width returns too large (for an unknown reason)
     dyn_img = crop_width_right(&dyn_img)?;
-    //dyn_img.save_with_format("x.png", ImageFormat::Png);
 
     let (rgba_img_fit, start, new_width) = resize_image_to_fit(&dyn_img, width, height, text_align);
     let dyn_img_fit = DynamicImage::ImageRgba8(rgba_img_fit);
@@ -323,7 +299,6 @@ fn generate_text_image_single_line(
 }
 
 fn crop_width_right(dyn_img: &DynamicImage) -> Result<DynamicImage, String> {
-    // compute the width we can reduce
     let width = dyn_img.width();
     let height = dyn_img.height();
 
@@ -337,9 +312,8 @@ fn crop_width_right(dyn_img: &DynamicImage) -> Result<DynamicImage, String> {
         }
 
         if found {
-            // ok, can't reduce more, now crop
             let mut new_img = RgbaImage::new(x + 1, height);
-            copy_image(&dyn_img, &mut new_img, 0, 0);
+            copy_image(dyn_img, &mut new_img, 0, 0);
             return Ok(DynamicImage::ImageRgba8(new_img));
         }
     }
@@ -367,7 +341,6 @@ pub fn copy_image(img_src: &DynamicImage, img_dst: &mut RgbaImage, x_offset: i32
     }
 }
 
-// fit the image to width/height. Return the image, the start point and the width
 fn resize_image_to_fit(
     img: &DynamicImage,
     width: u32,
