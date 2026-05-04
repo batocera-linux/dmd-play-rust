@@ -20,6 +20,13 @@ pub fn get_dmd_buffer_size(width: u32, height: u32) -> u32 {
     return (width * height * 3) as u32;
 }
 
+pub fn load_font(font_path: &str) -> Result<Vec<u8>, String> {
+    match read(Path::new(font_path)) {
+        Ok(x) => Ok(x),
+        Err(_) => Err(String::from("Unable to read font")),
+    }
+}
+
 pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
     orig_img: &T,
     text_align: &TextAlign,
@@ -151,7 +158,7 @@ fn get_text_x(font: &Font, scale: Scale, text: &str) -> i32 {
 
 pub fn generate_text_image(
     text: &str,
-    font_path: &str,
+    font_data: &[u8],
     gradient: &Option<DynamicImage>,
     width: u32,
     height: u32,
@@ -167,7 +174,7 @@ pub fn generate_text_image(
     if nlines == 1 {
         let (mut dyn_img, start, new_width) = generate_text_image_single_line(
             text,
-            font_path,
+            font_data,
             width,
             height,
             background_color,
@@ -194,7 +201,7 @@ pub fn generate_text_image(
         for line in lines {
             let (dyn_img, start, new_width) = generate_text_image_single_line(
                 line,
-                font_path,
+                font_data,
                 width,
                 section_height,
                 background_color,
@@ -266,14 +273,10 @@ fn apply_gradient(img: &DynamicImage, gradient: &DynamicImage) -> DynamicImage {
     return DynamicImage::ImageRgba8(new_img);
 }
 
-pub fn get_text_ratio(text: &str, font_path: &str, height: u32) -> Result<f32, String> {
-    let font_data = match read(Path::new(&font_path)) {
-        Ok(x) => x,
-        Err(_) => return Err(String::from("Unable to read font")),
-    };
-    let font = match Font::try_from_bytes(&font_data) {
+pub fn get_text_ratio(text: &str, font_data: &[u8], height: u32) -> Result<f32, String> {
+    let font = match Font::try_from_bytes(font_data) {
         Some(x) => x,
-        None => return Err(String::from("Unable to read font")),
+        None => return Err(String::from("Unable to parse font")),
     };
     let scale = Scale::uniform((height * 5) as f32); // 5x for a nicer image (more precision)
 
@@ -285,20 +288,16 @@ pub fn get_text_ratio(text: &str, font_path: &str, height: u32) -> Result<f32, S
 
 fn generate_text_image_single_line(
     text: &str,
-    font_path: &str,
+    font_data: &[u8],
     width: u32,
     height: u32,
     background_color: Rgba<u8>,
     text_color: Rgba<u8>,
     text_align: &TextAlign,
 ) -> Result<(DynamicImage, u32, u32), String> {
-    let font_data = match read(Path::new(&font_path)) {
-        Ok(x) => x,
-        Err(_) => return Err(String::from("Unable to read font")),
-    };
-    let font = match Font::try_from_bytes(&font_data) {
+    let font = match Font::try_from_bytes(font_data) {
         Some(x) => x,
-        None => return Err(String::from("Unable to read font")),
+        None => return Err(String::from("Unable to parse font")),
     };
     let scale = Scale::uniform((height * 5) as f32); // 5x for a nicer image (more precision)
 
@@ -314,7 +313,6 @@ fn generate_text_image_single_line(
 
     // hack: now, crop width cause we know that get_text_width returns too large (for an unknown reason)
     dyn_img = crop_width_right(&dyn_img)?;
-    //dyn_img.save_with_format("x.png", ImageFormat::Png);
 
     let (rgba_img_fit, start, new_width) = resize_image_to_fit(&dyn_img, width, height, text_align);
     let dyn_img_fit = DynamicImage::ImageRgba8(rgba_img_fit);

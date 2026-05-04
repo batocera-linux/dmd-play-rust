@@ -118,6 +118,24 @@ enum DMDLayer {
     SECOND,
 }
 
+struct DmdConfig {
+    width: u32,
+    height: u32,
+    header: [u8; DMD_HEADER_SIZE],
+}
+
+struct TextConfig<'a> {
+    font_data: &'a [u8],
+    gradient: &'a Option<DynamicImage>,
+    text_color: Rgba<u8>,
+    background_color: Rgba<u8>,
+    text_align: imageutils::TextAlign,
+    line_spacing: u8,
+    moving_text: bool,
+    fixed_text: bool,
+    speed: u32,
+}
+
 fn send_frame(
     mut client: &TcpStream,
     header: [u8; DMD_HEADER_SIZE],
@@ -169,26 +187,23 @@ fn get_header(width: u16, height: u16, layer: DMDLayer, nbytes: u32) -> [u8; DMD
 
 fn is_text_to_animate(
     text: &str,
-    font_path: &str,
-    line_spacing: u8,
-    dmd_width: u32,
-    dmd_height: u32,
-    force_moving_text: bool,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
 ) -> Result<(bool, u32), String> {
     let mut should_animate = false;
-    let mut animation_new_width = dmd_width;
+    let mut animation_new_width = dmd.width;
 
     let lines = text.split("\\n");
     let nlines = lines.clone().count() as u32;
 
     // animate if we use less than 1/3 of the height
     let accepable_ratio = 3.0;
-    let all_spaces = line_spacing as u32 * (nlines - 1);
-    let section_height = ((dmd_height - all_spaces) / nlines) as u32;
-    let dmd_ratio = dmd_width as f32 / dmd_height as f32;
+    let all_spaces = txt.line_spacing as u32 * (nlines - 1);
+    let section_height = ((dmd.height - all_spaces) / nlines) as u32;
+    let dmd_ratio = dmd.width as f32 / dmd.height as f32;
 
     for line in lines {
-        let text_ratio = match imageutils::get_text_ratio(line, font_path, section_height) {
+        let text_ratio = match imageutils::get_text_ratio(line, txt.font_data, section_height) {
             Ok(x) => x,
             Err(e) => {
                 return Err(e);
@@ -197,7 +212,7 @@ fn is_text_to_animate(
 
         // if at least one line require animation, then animate.
         let local_should_animate = text_ratio > dmd_ratio * accepable_ratio;
-        if local_should_animate || force_moving_text {
+        if local_should_animate || txt.moving_text {
             should_animate = true;
             let local_animation_new_width = (section_height as f32 * text_ratio) as u32;
             if local_animation_new_width > animation_new_width {
@@ -212,34 +227,27 @@ fn is_text_to_animate(
 
 fn get_dmd_animation_from_text(
     text: &str,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     text_width: u32,
-    background_color: Rgba<u8>,
-    text_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    speed: u32,
 ) -> Result<(Vec<Box<[u8]>>, Vec<u32>), String> {
     let (dyn_img, start, real_width) = imageutils::generate_text_image(
         text,
-        font_path,
-        &gradient,
+        txt.font_data,
+        &txt.gradient,
         text_width,
-        dmd_height,
-        background_color,
-        text_color,
-        text_align,
-        line_spacing,
+        dmd.height,
+        txt.background_color,
+        txt.text_color,
+        &txt.text_align,
+        txt.line_spacing,
     )?;
 
     let mut frames_dmd = Vec::new();
     let mut frames_duration = Vec::new();
 
-    for npixel in (0..dmd_width + (real_width - dmd_width) + dmd_width).rev() {
-        let mut new_img = RgbaImage::new(dmd_width, dmd_height);
+    for npixel in (0..dmd.width + (real_width - dmd.width) + dmd.width).rev() {
+        let mut new_img = RgbaImage::new(dmd.width, dmd.height);
         imageutils::copy_image(
             &dyn_img,
             &mut new_img,
@@ -249,8 +257,8 @@ fn get_dmd_animation_from_text(
         let img565: Box<[u8]> = match imageutils::image2dmdimage(
             &new_img,
             &imageutils::TextAlign::CENTER,
-            dmd_width,
-            dmd_height,
+            dmd.width,
+            dmd.height,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -258,7 +266,7 @@ fn get_dmd_animation_from_text(
             }
         };
         frames_dmd.push(img565);
-        frames_duration.push(speed);
+        frames_duration.push(txt.speed);
     }
 
     Ok((frames_dmd, frames_duration))
@@ -266,79 +274,51 @@ fn get_dmd_animation_from_text(
 
 fn send_image_text(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     text: &str,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    force_moving_text: bool,
-    force_fixed_text: bool,
-    speed: u32,
     once: bool,
 ) -> Result<bool, String> {
-    let mut new_width = dmd_width;
+    let mut new_width = dmd.width;
 
-    let (mut should_animate, animation_new_width) = is_text_to_animate(
-        text,
-        font_path,
-        line_spacing,
-        dmd_width,
-        dmd_height,
-        force_moving_text,
-    )?;
+    let (mut should_animate, animation_new_width) = is_text_to_animate(text, dmd, txt)?;
 
     if should_animate {
         new_width = animation_new_width;
     }
 
     // some options forces
-    if force_moving_text == false && force_fixed_text {
+    if txt.moving_text == false && txt.fixed_text {
         should_animate = false;
     }
 
     // play the animation, thus first, generate images, then play
     if should_animate {
-        let (frames_dmd, frames_duration) = get_dmd_animation_from_text(
-            text,
-            font_path,
-            &gradient,
-            dmd_width,
-            dmd_height,
-            new_width,
-            background_color,
-            text_color,
-            text_align,
-            line_spacing,
-            speed,
-        )?;
-        play_animation(header, &client, &frames_dmd, frames_duration, once)?;
+        let (frames_dmd, frames_duration) =
+            get_dmd_animation_from_text(text, dmd, txt, new_width)?;
+        play_animation(dmd.header, &client, &frames_dmd, frames_duration, once)?;
         Ok(true)
     } else {
         let (dyn_img, _start, _new_width) = imageutils::generate_text_image(
             text,
-            font_path,
-            &gradient,
-            dmd_width,
-            dmd_height,
-            background_color,
-            text_color,
-            text_align,
-            line_spacing,
+            txt.font_data,
+            &txt.gradient,
+            dmd.width,
+            dmd.height,
+            txt.background_color,
+            txt.text_color,
+            &txt.text_align,
+            txt.line_spacing,
         )?;
 
-        let img565 = match imageutils::image2dmdimage(&dyn_img, text_align, dmd_width, dmd_height) {
+        let img565 = match imageutils::image2dmdimage(&dyn_img, &txt.text_align, dmd.width, dmd.height) {
             Ok(x) => x,
             Err(e) => {
                 return Err(e.to_string());
             }
         };
 
-        match send_frame(&client, header, &img565) {
+        match send_frame(&client, dmd.header, &img565) {
             Ok(_) => {}
             Err(e) => {
                 return Err(e.to_string());
@@ -349,25 +329,21 @@ fn send_image_text(
 }
 
 fn handle_case_file(
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
     client: &TcpStream,
     file: String,
     once: bool,
 ) -> Result<bool, String> {
     if file.len() >= 4 && &file[file.len() - 4..] == ".gif" {
-        send_image_file_gif(header, dmd_width, dmd_height, client, file, once)
+        send_image_file_gif(dmd, client, file, once)
     } else {
-        send_image_file_basic(client, header, dmd_width, dmd_height, file)?;
+        send_image_file_basic(client, dmd, file)?;
         Ok(false)
     }
 }
 
 fn send_image_file_gif(
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
     client: &TcpStream,
     file: String,
     once: bool,
@@ -404,8 +380,8 @@ fn send_image_file_gif(
         let img565: Box<[u8]> = match imageutils::image2dmdimage(
             &orig_img,
             &imageutils::TextAlign::CENTER,
-            dmd_width,
-            dmd_height,
+            dmd.width,
+            dmd.height,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -418,7 +394,7 @@ fn send_image_file_gif(
     }
 
     if frames_dmd.len() == 1 {
-        match send_frame(&client, header, &frames_dmd[0]) {
+        match send_frame(&client, dmd.header, &frames_dmd[0]) {
             Ok(_) => {}
             Err(e) => {
                 return Err(e.to_string());
@@ -426,7 +402,7 @@ fn send_image_file_gif(
         };
         Ok(false)
     } else {
-        play_animation(header, &client, &frames_dmd, frames_duration, once)?;
+        play_animation(dmd.header, &client, &frames_dmd, frames_duration, once)?;
         Ok(true)
     }
 }
@@ -462,9 +438,7 @@ fn play_animation(
 
 fn send_image_file_basic(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
+    dmd: &DmdConfig,
     file: String,
 ) -> Result<(), String> {
     let orig_img_code = match Reader::open(file) {
@@ -484,8 +458,8 @@ fn send_image_file_basic(
     let img565: Box<[u8]> = match imageutils::image2dmdimage(
         &orig_img,
         &imageutils::TextAlign::CENTER,
-        dmd_width,
-        dmd_height,
+        dmd.width,
+        dmd.height,
     ) {
         Ok(img) => img,
         Err(e) => {
@@ -493,7 +467,7 @@ fn send_image_file_basic(
         }
     };
 
-    match send_frame(&client, header, &img565) {
+    match send_frame(&client, dmd.header, &img565) {
         Ok(_) => {}
         Err(e) => {
             return Err(e.to_string());
@@ -525,18 +499,8 @@ fn strfdelta(duration: TimeDelta, format: &str) -> String {
 
 fn handle_clock(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    moving_text: bool,
-    fixed_text: bool,
-    speed: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     clock_format: Option<String>,
     h12: bool,
     no_seconds: bool,
@@ -571,23 +535,7 @@ fn handle_clock(
         if previous_txt != localtime {
             previous_txt = localtime.clone();
 
-            let _ = match send_image_text(
-                &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &localtime,
-                &font_path,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                line_spacing,
-                moving_text,
-                fixed_text,
-                speed,
-                true,
-            ) {
+            let _ = match send_image_text(&client, dmd, txt, &localtime, true) {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("{}", e.to_string());
@@ -601,18 +549,8 @@ fn handle_clock(
 
 fn handle_countdown(
     client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    font_path: &str,
-    gradient: &Option<DynamicImage>,
-    text_color: Rgba<u8>,
-    background_color: Rgba<u8>,
-    text_align: &imageutils::TextAlign,
-    line_spacing: u8,
-    moving_text: bool,
-    fixed_text: bool,
-    speed: u32,
+    dmd: &DmdConfig,
+    txt: &TextConfig,
     countdown: String,
     countdown_header: Option<String>,
     countdown_format: String,
@@ -663,23 +601,7 @@ fn handle_countdown(
                 if previous_txt != countdown_str {
                     previous_txt = countdown_str.clone();
 
-                    let _ = match send_image_text(
-                        &client,
-                        header,
-                        dmd_width,
-                        dmd_height,
-                        &countdown_str,
-                        &font_path,
-                        &gradient,
-                        text_color,
-                        background_color,
-                        &text_align,
-                        line_spacing,
-                        moving_text,
-                        fixed_text,
-                        speed,
-                        true,
-                    ) {
+                    let _ = match send_image_text(&client, dmd, txt, &countdown_str, true) {
                         Ok(_) => {}
                         Err(e) => {
                             eprintln!("{}", e.to_string());
@@ -737,7 +659,6 @@ fn main() {
         }
     };
 
-    //
     let mut layer = DMDLayer::MAIN;
 
     let mut dmd_width;
@@ -752,16 +673,12 @@ fn main() {
     }
 
     match args.width {
-        Some(x) => {
-            dmd_width = x;
-        }
+        Some(x) => { dmd_width = x; }
         None => {}
     };
 
     match args.height {
-        Some(x) => {
-            dmd_height = x;
-        }
+        Some(x) => { dmd_height = x; }
         None => {}
     };
 
@@ -779,6 +696,12 @@ fn main() {
         layer,
         imageutils::get_dmd_buffer_size(dmd_width, dmd_height),
     );
+
+    let dmd = DmdConfig {
+        width: dmd_width,
+        height: dmd_height,
+        header,
+    };
 
     let text_align;
 
@@ -816,10 +739,29 @@ fn main() {
         None => None,
     };
 
+    let font_data = match imageutils::load_font(&args.font) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
+
+    let txt = TextConfig {
+        font_data: &font_data,
+        gradient: &gradient,
+        text_color,
+        background_color,
+        text_align,
+        line_spacing: args.line_spacing,
+        moving_text: args.moving_text,
+        fixed_text: args.fixed_text,
+        speed: args.speed,
+    };
+
     match args.file {
         Some(file) => {
-            let _ = match handle_case_file(header, dmd_width, dmd_height, &client, file, args.once)
-            {
+            let _ = match handle_case_file(&dmd, &client, file, args.once) {
                 Ok(x) => {
                     was_animation = x;
                 }
@@ -837,23 +779,7 @@ fn main() {
             if args.caps {
                 dsp_text = text.to_uppercase().replace("\\N", "\\n");
             }
-            let _ = match send_image_text(
-                &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &dsp_text,
-                &args.font,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                args.line_spacing,
-                args.moving_text,
-                args.fixed_text,
-                args.speed,
-                args.once,
-            ) {
+            let _ = match send_image_text(&client, &dmd, &txt, &dsp_text, args.once) {
                 Ok(x) => {
                     was_animation = x;
                 }
@@ -868,18 +794,8 @@ fn main() {
     if args.clock {
         handle_clock(
             &client,
-            header,
-            dmd_width,
-            dmd_height,
-            &args.font,
-            &gradient,
-            text_color,
-            background_color,
-            &text_align,
-            args.line_spacing,
-            args.moving_text,
-            args.fixed_text,
-            args.speed,
+            &dmd,
+            &txt,
             args.clock_format,
             args.h12,
             args.no_seconds,
@@ -890,18 +806,8 @@ fn main() {
         Some(countdown) => {
             match handle_countdown(
                 &client,
-                header,
-                dmd_width,
-                dmd_height,
-                &args.font,
-                &gradient,
-                text_color,
-                background_color,
-                &text_align,
-                args.line_spacing,
-                args.moving_text,
-                args.fixed_text,
-                args.speed,
+                &dmd,
+                &txt,
                 countdown,
                 args.countdown_header,
                 args.countdown_format,
@@ -923,19 +829,12 @@ fn main() {
 
         let _ = match send_image_text(
             &client,
-            header,
-            dmd_width,
-            dmd_height,
+            &dmd,
+            &TextConfig {
+                text_color: background_color,
+                ..txt
+            },
             "",
-            &args.font,
-            &gradient,
-            background_color,
-            background_color,
-            &imageutils::TextAlign::CENTER,
-            0,
-            args.moving_text,
-            args.fixed_text,
-            args.speed,
             args.once,
         ) {
             Ok(_) => {}
