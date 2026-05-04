@@ -53,11 +53,6 @@ pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
     let mut bytes: Box<[u8]> =
         vec![0u8; get_dmd_buffer_size(dmd_width, dmd_height) as usize].into_boxed_slice();
 
-    // init to 0
-    for i in 0..bytes.len() {
-        bytes[i] = 0;
-    }
-
     let x_offset = match text_align {
         TextAlign::CENTER => (dmd_width - width) / 2,
         TextAlign::LEFT => 0,

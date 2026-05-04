@@ -3,7 +3,7 @@ use clap::Parser;
 use image::{
     codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, DynamicImage, Rgba, RgbaImage,
 };
-use std::{fs::File, io::BufReader, io::Write, net::TcpStream, thread, time::Duration};
+use std::{fs::File, io::BufReader, io::Write, net::TcpStream, path::Path, thread, time::Duration};
 
 mod imageutils;
 
@@ -356,7 +356,13 @@ fn handle_case_file(
     file: String,
     once: bool,
 ) -> Result<bool, String> {
-    if file.len() >= 4 && &file[file.len() - 4..] == ".gif" {
+    let ext = Path::new(&file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if ext == "gif" {
         send_image_file_gif(header, dmd_width, dmd_height, client, file, once)
     } else {
         send_image_file_basic(client, header, dmd_width, dmd_height, file)?;
@@ -434,15 +440,12 @@ fn send_image_file_gif(
 fn play_animation(
     header: [u8; DMD_HEADER_SIZE],
     client: &TcpStream,
-    frames_dmd: &Vec<Box<[u8]>>,
+    frames_dmd: &[Box<[u8]>],
     frames_duration: Vec<u32>,
     once: bool,
 ) -> Result<(), String> {
-    let mut n;
-
     loop {
-        n = 0;
-        for img565 in frames_dmd {
+        for (n, img565) in frames_dmd.iter().enumerate() {
             match send_frame(&client, header, &img565) {
                 Ok(_) => {}
                 Err(e) => {
@@ -451,7 +454,6 @@ fn play_animation(
             };
 
             thread::sleep(Duration::from_millis(frames_duration[n] as u64));
-            n = n + 1;
         }
 
         if once {
@@ -638,17 +640,12 @@ fn handle_countdown(
                 let delta = (target_datetime - now).abs();
                 let total_seconds = delta.num_seconds();
 
-                if (total_seconds >= 0 && total_seconds < 60)
-                    || (total_seconds < 0 && total_seconds > -60)
-                {
+                // delta.abs() guarantees total_seconds >= 0
+                if total_seconds < 60 {
                     countdown_str = strfdelta(delta, &countdown_format_0_minute.to_string());
-                } else if (total_seconds > 0 && total_seconds < 3600)
-                    || (total_seconds < 0 && total_seconds > -3600)
-                {
+                } else if total_seconds < 3600 {
                     countdown_str = strfdelta(delta, &countdown_format_0_hour.to_string());
-                } else if (total_seconds > 0 && total_seconds < 86400)
-                    || (total_seconds < 0 && total_seconds > -86400)
-                {
+                } else if total_seconds < 86400 {
                     countdown_str = strfdelta(delta, &countdown_format_0_day.to_string());
                 } else {
                     countdown_str = strfdelta(delta, &countdown_format.to_string());
@@ -726,6 +723,10 @@ fn main() {
     if nplay > 1 {
         eprintln!("Only one action required");
         return;
+    }
+
+    if args.moving_text && args.fixed_text {
+        eprintln!("Warning: --moving-text and --fixed-text are both set; --moving-text takes precedence");
     }
 
     let server_address = format!("{}:{}", args.host, args.port);
