@@ -1,8 +1,8 @@
 use chrono::{Local, NaiveDateTime, TimeDelta, TimeZone};
 use clap::Parser;
 use image::{
-    codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, DynamicImage, Frame, Rgba,
-    RgbaImage,
+    codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, Delay, DynamicImage, Frame,
+    Rgba, RgbaImage,
 };
 use std::{fs::File, io::BufReader, io::Write, net::TcpStream, thread, time::Duration};
 
@@ -356,52 +356,93 @@ fn handle_case_file(
     client: &TcpStream,
     file: String,
     once: bool,
+    default_duration: u32,
 ) -> Result<bool, String> {
-    if file.len() >= 4 && &file[file.len() - 4..] == ".gif" {
-        send_image_file_gif(header, dmd_width, dmd_height, client, file, once)
-    } else {
-        send_image_file_basic(client, header, dmd_width, dmd_height, file)?;
-        Ok(false)
-    }
+    send_image_files(
+        header,
+        dmd_width,
+        dmd_height,
+        client,
+        file,
+        once,
+        default_duration,
+    )
 }
 
-fn file_gif_to_frames(file: String) -> Result<Vec<Frame>, String> {
+fn frames_from_gif(file: &str) -> Result<Vec<Frame>, String> {
+    let fd = match File::open(file) {
+        Ok(x) => x,
+        Err(e) => return Err(e.to_string()),
+    };
+    let reader = BufReader::new(fd);
+    let decoder = match GifDecoder::new(reader) {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
+
+    let frames: Result<Vec<Frame>, _> = decoder.into_frames().collect_frames();
+    frames.map_err(|e| format!("Error: {}: {}", file, e))
+}
+
+fn frame_from_image(file: &str, default_duration: u32) -> Result<Frame, String> {
+    let orig_img_code = match Reader::open(file) {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
+
+    let orig_img = match orig_img_code.decode() {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
+
+    Ok(Frame::from_parts(
+        orig_img.to_rgba8(),
+        0,
+        0,
+        Delay::from_numer_denom_ms(default_duration, 1),
+    ))
+}
+
+fn files_to_frames(file: String, default_duration: u32) -> Result<Vec<Frame>, String> {
     let paths: Vec<&str> = file.split(':').collect();
     let mut all_frames = Vec::new();
 
     for path in paths {
-        let fd = match File::open(path) {
-            Ok(x) => x,
-            Err(e) => return Err(e.to_string()),
-        };
-        let reader = BufReader::new(fd);
-        let decoder = match GifDecoder::new(reader) {
-            Ok(x) => x,
-            Err(e) => {
-                return Err(e.to_string());
+        if path.len() >= 4 && &path[path.len() - 4..] == ".gif" {
+            let frames = frames_from_gif(path).map_err(|e| e.to_string())?;
+            all_frames.extend(frames);
+        } else {
+            match frame_from_image(path, default_duration) {
+                Ok(frame) => {
+                    all_frames.push(frame);
+                }
+                Err(e) => {
+                    return Err(e.to_string());
+                }
             }
-        };
-
-        let frames: Result<Vec<Frame>, _> = decoder.into_frames().collect_frames();
-        let frames = frames.map_err(|e| format!("Error: {}: {}", path, e))?;
-
-        all_frames.extend(frames);
+        }
     }
-
     Ok(all_frames)
 }
 
-fn send_image_file_gif(
+fn send_image_files(
     header: [u8; DMD_HEADER_SIZE],
     dmd_width: u32,
     dmd_height: u32,
     client: &TcpStream,
     file: String,
     once: bool,
+    default_duration: u32,
 ) -> Result<bool, String> {
     let mut frames_dmd = Vec::new();
     let mut frames_duration = Vec::new();
-    match file_gif_to_frames(file) {
+    match files_to_frames(file, default_duration) {
         Ok(frames) => {
             // build the animation array
             for frame in frames {
@@ -472,49 +513,6 @@ fn play_animation(
             return Ok(());
         }
     }
-}
-
-fn send_image_file_basic(
-    client: &TcpStream,
-    header: [u8; DMD_HEADER_SIZE],
-    dmd_width: u32,
-    dmd_height: u32,
-    file: String,
-) -> Result<(), String> {
-    let orig_img_code = match Reader::open(file) {
-        Ok(x) => x,
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
-
-    let orig_img = match orig_img_code.decode() {
-        Ok(x) => x,
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
-
-    let img565: Box<[u8]> = match imageutils::image2dmdimage(
-        &orig_img,
-        &imageutils::TextAlign::CENTER,
-        dmd_width,
-        dmd_height,
-    ) {
-        Ok(img) => img,
-        Err(e) => {
-            return Err(e);
-        }
-    };
-
-    match send_frame(&client, header, &img565) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(e.to_string());
-        }
-    };
-
-    Ok(())
 }
 
 fn strfdelta(duration: TimeDelta, format: &str) -> String {
@@ -832,8 +830,17 @@ fn main() {
 
     match args.file {
         Some(file) => {
-            let _ = match handle_case_file(header, dmd_width, dmd_height, &client, file, args.once)
-            {
+            let duration_default = 2000; // time in case a single image is mixted with animations (2 seconds)
+
+            let _ = match handle_case_file(
+                header,
+                dmd_width,
+                dmd_height,
+                &client,
+                file,
+                args.once,
+                duration_default,
+            ) {
                 Ok(x) => {
                     was_animation = x;
                 }
