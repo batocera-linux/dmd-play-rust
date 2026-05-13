@@ -1,7 +1,8 @@
 use chrono::{Local, NaiveDateTime, TimeDelta, TimeZone};
 use clap::Parser;
 use image::{
-    codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, DynamicImage, Rgba, RgbaImage,
+    codecs::gif::GifDecoder, imageops, io::Reader, AnimationDecoder, DynamicImage, Frame, Rgba,
+    RgbaImage,
 };
 use std::{fs::File, io::BufReader, io::Write, net::TcpStream, thread, time::Duration};
 
@@ -364,6 +365,32 @@ fn handle_case_file(
     }
 }
 
+fn file_gif_to_frames(file: String) -> Result<Vec<Frame>, String> {
+    let paths: Vec<&str> = file.split(':').collect();
+    let mut all_frames = Vec::new();
+
+    for path in paths {
+        let fd = match File::open(path) {
+            Ok(x) => x,
+            Err(e) => return Err(e.to_string()),
+        };
+        let reader = BufReader::new(fd);
+        let decoder = match GifDecoder::new(reader) {
+            Ok(x) => x,
+            Err(e) => {
+                return Err(e.to_string());
+            }
+        };
+
+        let frames: Result<Vec<Frame>, _> = decoder.into_frames().collect_frames();
+        let frames = frames.map_err(|e| format!("Error: {}: {}", path, e))?;
+
+        all_frames.extend(frames);
+    }
+
+    Ok(all_frames)
+}
+
 fn send_image_file_gif(
     header: [u8; DMD_HEADER_SIZE],
     dmd_width: u32,
@@ -372,49 +399,36 @@ fn send_image_file_gif(
     file: String,
     once: bool,
 ) -> Result<bool, String> {
-    let fd = match File::open(file) {
-        Ok(x) => x,
-        Err(e) => return Err(e.to_string()),
-    };
-    let reader = BufReader::new(fd);
-    let decoder = match GifDecoder::new(reader) {
-        Ok(x) => x,
+    let mut frames_dmd = Vec::new();
+    let mut frames_duration = Vec::new();
+    match file_gif_to_frames(file) {
+        Ok(frames) => {
+            // build the animation array
+            for frame in frames {
+                let (x, y) = frame.delay().numer_denom_ms();
+                let duration = (x as f32 / y as f32) as u32;
+
+                let orig_img = frame.into_buffer();
+
+                let img565: Box<[u8]> = match imageutils::image2dmdimage(
+                    &orig_img,
+                    &imageutils::TextAlign::CENTER,
+                    dmd_width,
+                    dmd_height,
+                ) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        return Err(e.to_string());
+                    }
+                };
+
+                frames_dmd.push(img565);
+                frames_duration.push(duration);
+            }
+        }
         Err(e) => {
             return Err(e.to_string());
         }
-    };
-
-    let frames = decoder.into_frames();
-    let mut frames_dmd = Vec::new();
-    let mut frames_duration = Vec::new();
-
-    // build the animation array
-    for frame in frames {
-        let frame = match frame {
-            Ok(x) => x,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
-        let (x, y) = frame.delay().numer_denom_ms();
-        let duration = (x as f32 / y as f32) as u32;
-
-        let orig_img = frame.into_buffer();
-
-        let img565: Box<[u8]> = match imageutils::image2dmdimage(
-            &orig_img,
-            &imageutils::TextAlign::CENTER,
-            dmd_width,
-            dmd_height,
-        ) {
-            Ok(img) => img,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
-
-        frames_dmd.push(img565);
-        frames_duration.push(duration);
     }
 
     if frames_dmd.len() == 1 {

@@ -17,7 +17,7 @@ fn rgb888_to_rgb565(r: u8, g: u8, b: u8) -> u16 {
 }
 
 pub fn get_dmd_buffer_size(width: u32, height: u32) -> u32 {
-    return (width * height * 3) as u32;
+    return (width * height * 2) as u32;
 }
 
 pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
