@@ -9,7 +9,12 @@ pub enum TextAlign {
     RIGHT,
 }
 
-fn rgb888_to_rgb565(r: u8, g: u8, b: u8) -> u16 {
+fn rgb888_to_rgb565(r: u8, g: u8, b: u8, t: u8) -> u16 {
+   // if too much transparent : put it black
+    if t < 128 {
+        return 0;
+    }
+
     let r5 = (r as u16) >> 3;
     let g6 = (g as u16) >> 2;
     let b5 = (b as u16) >> 3;
@@ -73,7 +78,7 @@ pub fn image2dmdimage<T: GenericImageView<Pixel = Rgba<u8>>>(
                 let idx: usize = idx_u32 as usize;
                 if x >= x_offset && x < (width + x_offset) {
                     let pixel = resized_img.get_pixel(x - x_offset, y - y_offset);
-                    let val: u16 = rgb888_to_rgb565(pixel[0], pixel[1], pixel[2]);
+                    let val: u16 = rgb888_to_rgb565(pixel[0], pixel[1], pixel[2], pixel[3]);
                     bytes[idx..idx + 2].copy_from_slice(&val.to_be_bytes());
                 }
             }
@@ -314,7 +319,7 @@ fn generate_text_image_single_line(
 
     // hack: now, crop width cause we know that get_text_width returns too large (for an unknown reason)
     dyn_img = crop_width_right(&dyn_img)?;
-    //dyn_img.save_with_format("x.png", ImageFormat::Png);
+    //let _ = dyn_img.save_with_format("x.png", ImageFormat::Png);
 
     let (rgba_img_fit, start, new_width) = resize_image_to_fit(&dyn_img, width, height, text_align);
     let dyn_img_fit = DynamicImage::ImageRgba8(rgba_img_fit);
