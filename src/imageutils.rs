@@ -10,14 +10,19 @@ pub enum TextAlign {
 }
 
 fn rgb888_to_rgb565(r: u8, g: u8, b: u8, t: u8) -> u16 {
-   // if too much transparent : put it black
-    if t < 128 {
+    if t == 0 {
         return 0;
     }
 
-    let r5 = (r as u16) >> 3;
-    let g6 = (g as u16) >> 2;
-    let b5 = (b as u16) >> 3;
+    // apply transparency
+    let r_blended = ((r as u32 * t as u32) / 255) as u8;
+    let g_blended = ((g as u32 * t as u32) / 255) as u8;
+    let b_blended = ((b as u32 * t as u32) / 255) as u8;
+
+    let r5 = (r_blended as u16) >> 3;
+    let g6 = (g_blended as u16) >> 2;
+    let b5 = (b_blended as u16) >> 3;
+
     (r5 << 11) | (g6 << 5) | b5
 }
 
