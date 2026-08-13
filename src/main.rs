@@ -782,7 +782,7 @@ fn main() {
     }
 
     let background_color = Rgba([0, 0, 0, 255]);
-    let text_color = Rgba([args.red, args.green, args.blue, 0]);
+    let text_color = Rgba([args.red, args.green, args.blue, 255]);
 
     // compute the header only once while it is always the same one
     let header = get_header(
